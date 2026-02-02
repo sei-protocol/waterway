@@ -11,11 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -487,11 +485,8 @@ func (s *Sluice) Start(ctx context.Context) error {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 16,
 	}
-
-	done := make(chan os.Signal, 1)
-	signal.Notify(done, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		<-done
+		<-ctx.Done()
 		logger.Info("shutting down...")
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()

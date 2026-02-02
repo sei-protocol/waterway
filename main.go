@@ -23,7 +23,6 @@ func main() {
 				if err != nil {
 					return err
 				}
-
 			}
 
 			sluice, err := NewSluice(ctx, opts...)
