@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	meter           = otel.Meter("sluice")
+	meter           = otel.Meter("waterway")
 	bytesSizeBucket = otelmetric.WithExplicitBucketBoundaries(100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000)
 	secondsBucket   = otelmetric.WithExplicitBucketBoundaries(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10)
 	metrics         = struct {
@@ -59,7 +59,7 @@ var (
 )
 
 func init() {
-	exporter, err := prometheus.New(prometheus.WithNamespace("sluice"))
+	exporter, err := prometheus.New(prometheus.WithNamespace("waterway"))
 	if err != nil {
 		logger.Error("failed to init prometheus exporter", "err", err)
 		panic(err)

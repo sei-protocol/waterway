@@ -1,4 +1,4 @@
-# :potable_water:  Sluice
+# :potable_water:  Waterway
 
 A high-performance JSON-RPC 2.0 proxy for Sei blockchain nodes with WebSocket pooling, automatic HTTP fallback, and response caching.
 
@@ -16,7 +16,7 @@ A high-performance JSON-RPC 2.0 proxy for Sei blockchain nodes with WebSocket po
 ## Quick Start
 
 ```go
-sluice, err := NewSluice(ctx,
+waterway, err := NewWaterway(ctx,
     WithListenAddr(":8545"),
     WithSeiWSEndpoint("ws://localhost:26657/websocket"),
     WithSeiHTTPEndpoint("http://localhost:26657"),
@@ -24,7 +24,7 @@ sluice, err := NewSluice(ctx,
 if err != nil {
     log.Fatal(err)
 }
-sluice.Start(ctx)
+waterway.Start(ctx)
 ```
 
 ## Endpoints
@@ -37,7 +37,7 @@ sluice.Start(ctx)
 
 ## Configuration Options
 
-Configure via `Option` functions passed to `NewSluice()`:
+Configure via `Option` functions passed to `NewWaterway()`:
 
 - `WithListenAddr` — Server bind address
 - `WithSeiWSEndpoint` — Upstream WebSocket URL

@@ -60,7 +60,7 @@ func (c *MemcachedCache) buildKey(req *JSONRPCRequest) string {
 			h.Write(req.Params)
 		}
 	}
-	return "sluice:" + hex.EncodeToString(h.Sum(nil))[:32]
+	return "waterway:" + hex.EncodeToString(h.Sum(nil))[:32]
 }
 
 // Get retrieves a cached response
@@ -128,7 +128,7 @@ func (c *MemcachedCache) hasVolatileBlockTag(req *JSONRPCRequest) bool {
 // Ping checks if the cache is healthy
 func (c *MemcachedCache) Ping() error {
 	return c.client.Set(&memcache.Item{
-		Key:        "sluice:ping",
+		Key:        "waterway:ping",
 		Value:      []byte("pong"),
 		Expiration: 1,
 	})

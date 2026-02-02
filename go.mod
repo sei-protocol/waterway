@@ -1,4 +1,4 @@
-module github.com/sei-protocol/sluice
+module github.com/sei-protocol/waterway
 
 go 1.25.6
 

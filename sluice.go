@@ -65,8 +65,8 @@ func newErrorResponse(id json.RawMessage, code int, message string) *JSONRPCResp
 	}
 }
 
-// Sluice is the main proxy server
-type Sluice struct {
+// Waterway is the main proxy server
+type Waterway struct {
 	*options
 
 	wsPool          *WSPool
@@ -76,14 +76,14 @@ type Sluice struct {
 	wsFailedMethods sync.Map
 }
 
-// NewSluice creates a new Sluice proxy instance
-func NewSluice(ctx context.Context, opt ...Option) (*Sluice, error) {
+// NewWaterway creates a new Waterway proxy instance
+func NewWaterway(ctx context.Context, opt ...Option) (*Waterway, error) {
 	opts, err := newOptions(opt...)
 	if err != nil {
 		return nil, err
 	}
 
-	s := &Sluice{
+	s := &Waterway{
 		options: opts,
 		cache:   NewMemcachedCache(opts.cacheableMethods, opts.memcachedServers...),
 		httpClient: &http.Client{
@@ -125,7 +125,7 @@ func makeOriginChecker(allowed []string) func(*http.Request) bool {
 	return func(r *http.Request) bool { return set[strings.ToLower(r.Header.Get("Origin"))] }
 }
 
-func (s *Sluice) validateRequest(req *JSONRPCRequest) *JSONRPCError {
+func (s *Waterway) validateRequest(req *JSONRPCRequest) *JSONRPCError {
 	if req.JSONRPC != "2.0" {
 		return &JSONRPCError{Code: ErrCodeInvalidRequest, Message: "Invalid JSON-RPC version"}
 	}
@@ -147,7 +147,7 @@ func (s *Sluice) validateRequest(req *JSONRPCRequest) *JSONRPCError {
 	return nil
 }
 
-func (s *Sluice) callHTTP(ctx context.Context, req *JSONRPCRequest) (*JSONRPCResponse, error) {
+func (s *Waterway) callHTTP(ctx context.Context, req *JSONRPCRequest) (*JSONRPCResponse, error) {
 	defer func(start time.Time) {
 		metrics.upstreamDuration.Record(ctx, time.Since(start).Seconds(), otelmetric.WithAttributes(
 			attribute.String("transport", "http"),
@@ -174,7 +174,7 @@ func (s *Sluice) callHTTP(ctx context.Context, req *JSONRPCRequest) (*JSONRPCRes
 	return &rpcResp, nil
 }
 
-func (s *Sluice) callWS(ctx context.Context, req *JSONRPCRequest) (*JSONRPCResponse, error) {
+func (s *Waterway) callWS(ctx context.Context, req *JSONRPCRequest) (*JSONRPCResponse, error) {
 	defer func(start time.Time) {
 		metrics.upstreamDuration.Record(ctx, time.Since(start).Seconds(), otelmetric.WithAttributes(
 			attribute.String("transport", "ws"),
@@ -189,7 +189,7 @@ func (s *Sluice) callWS(ctx context.Context, req *JSONRPCRequest) (*JSONRPCRespo
 	return conn.Call(ctx, req, s.wsTimeout)
 }
 
-func (s *Sluice) shouldUseHTTP(method string) bool {
+func (s *Waterway) shouldUseHTTP(method string) bool {
 	if s.httpOnlyMethods[method] {
 		return true
 	}
@@ -197,7 +197,7 @@ func (s *Sluice) shouldUseHTTP(method string) bool {
 	return failed
 }
 
-func (s *Sluice) call(ctx context.Context, req *JSONRPCRequest) (*JSONRPCResponse, error) {
+func (s *Waterway) call(ctx context.Context, req *JSONRPCRequest) (*JSONRPCResponse, error) {
 	transport, status := "ws", "success"
 	defer func(start time.Time) { recordRequest(ctx, req.Method, transport, status, time.Since(start)) }(time.Now())
 
@@ -281,7 +281,7 @@ func isWSIncompatibleError(err *JSONRPCError) bool {
 	return false
 }
 
-func (s *Sluice) handleHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Waterway) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "OPTIONS" {
 		s.setCORS(w)
 		return
@@ -344,7 +344,7 @@ func (s *Sluice) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Sluice) handleWS(w http.ResponseWriter, r *http.Request) {
+func (s *Waterway) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -439,7 +439,7 @@ func (s *Sluice) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Sluice) setCORS(w http.ResponseWriter) {
+func (s *Waterway) setCORS(w http.ResponseWriter) {
 	if len(s.allowedOrigins) == 0 {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 	} else {
@@ -449,7 +449,7 @@ func (s *Sluice) setCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 }
 
-func (s *Sluice) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (s *Waterway) handleHealth(w http.ResponseWriter, r *http.Request) {
 	status := map[string]interface{}{
 		"status":    "ok",
 		"ws_pool":   s.wsPool.IsHealthy(),
@@ -464,7 +464,7 @@ func (s *Sluice) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // Start starts the proxy server
-func (s *Sluice) Start(ctx context.Context) error {
+func (s *Waterway) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if websocket.IsWebSocketUpgrade(r) {
@@ -494,7 +494,7 @@ func (s *Sluice) Start(ctx context.Context) error {
 		_ = server.Shutdown(ctx)
 	}()
 
-	logger.Info("starting sluice",
+	logger.Info("starting waterway",
 		"addr", s.listenAddr,
 		"ws", s.seiWSEndpoint,
 		"http", s.seiHTTPEndpoint,
