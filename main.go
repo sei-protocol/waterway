@@ -8,7 +8,6 @@ import (
 	"syscall"
 
 	"github.com/urfave/cli/v3"
-	_ "github.com/urfave/cli/v3"
 )
 
 var configPath string
