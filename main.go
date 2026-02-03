@@ -2,20 +2,49 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/urfave/cli/v3"
 )
 
-var configPath string
+var (
+	configPath string
+)
 
 func main() {
 	cmd := cli.Command{
 		Name:  "waterway",
 		Usage: "Sei EVM RPC Proxy with WebSocket to HTTP Fallback",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "log-level",
+				Aliases: []string{"l"},
+				Usage:   "Set log level (debug, info, warn, error)",
+				Value:   "info",
+				Sources: cli.EnvVars("LOG_LEVEL"),
+				Action: func(ctx context.Context, command *cli.Command, level string) error {
+					switch strings.ToLower(strings.TrimSpace(level)) {
+					case "debug":
+						logLevel.Set(slog.LevelDebug)
+					case "info":
+						logLevel.Set(slog.LevelInfo)
+					case "warn", "warning":
+						logLevel.Set(slog.LevelWarn)
+					case "error":
+						logLevel.Set(slog.LevelError)
+					default:
+						return fmt.Errorf("invalid log level: %s", level)
+					}
+					return nil
+				},
+			},
+		},
 		Action: func(ctx context.Context, command *cli.Command) error {
 			var err error
 			var opts []Option

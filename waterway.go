@@ -22,7 +22,10 @@ import (
 	otelmetric "go.opentelemetry.io/otel/metric"
 )
 
-var logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+var (
+	logLevel = &slog.LevelVar{}
+	logger   = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+)
 
 // Waterway is the main proxy server
 type Waterway struct {
