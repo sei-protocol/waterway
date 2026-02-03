@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/urfave/cli/v3"
 	_ "github.com/urfave/cli/v3"
@@ -25,13 +27,21 @@ func main() {
 				}
 			}
 
-			waterway, err := NewWaterway(ctx, opts...)
+			waterway, err := NewWaterway(opts...)
 			if err != nil {
-				logger.Error("Failed to instantiate Waterway", "err", err)
+				logger.Error("Failed to instantiate", "err", err)
 				return err
 			}
 			if err := waterway.Start(ctx); err != nil {
-				logger.Error("Failed to start Waterway", "err", err)
+				logger.Error("Failed to start", "err", err)
+				return err
+			}
+
+			signals := make(chan os.Signal, 1)
+			signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
+			<-signals
+			if err := waterway.Shutdown(ctx); err != nil {
+				logger.Error("Failed to shutdown gracefully", "err", err)
 				return err
 			}
 			return nil

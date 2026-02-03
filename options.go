@@ -1,6 +1,10 @@
 package main
 
-import "time"
+import (
+	"errors"
+	"strings"
+	"time"
+)
 
 // Option is a function that configures the application
 type Option func(*options) error
@@ -12,7 +16,7 @@ type options struct {
 	seiWSEndpoint   string
 	seiHTTPEndpoint string
 
-	allowedOrigins  []string
+	allowedOrigins  map[string]bool
 	allowedMethods  map[string]bool
 	blockedMethods  map[string]bool
 	maxRequestSize  int64
@@ -21,15 +25,16 @@ type options struct {
 	httpOnlyMethods map[string]bool
 
 	maxWSConnections   int
-	wsTimeout          time.Duration
+	wsReadTimeout      time.Duration
+	wsWriteTimeout     time.Duration
 	httpTimeout        time.Duration
 	wsPingInterval     time.Duration
 	wsMaxMessageSize   int64
 	maxConcurrentBatch int
 	connectionMaxAge   time.Duration
 
+	cache            Cache
 	memcachedServers []string
-	cacheEnabled     bool
 	cacheTTL         time.Duration
 	cacheableMethods map[string]MethodCache
 }
@@ -61,13 +66,14 @@ func newOptions(opt ...Option) (*options, error) {
 			"eth_getLogs": true,
 		},
 		maxWSConnections:   20,
-		wsTimeout:          30 * time.Second,
+		wsReadTimeout:      30 * time.Second,
+		wsWriteTimeout:     10 * time.Second,
 		httpTimeout:        60 * time.Second,
 		wsPingInterval:     30 * time.Second,
 		wsMaxMessageSize:   4 << 20,
 		maxConcurrentBatch: 50,
 		connectionMaxAge:   5 * time.Minute,
-		cacheEnabled:       false,
+		cache:              NoopCache{},
 		cacheTTL:           5 * time.Second,
 		cacheableMethods: map[string]MethodCache{
 			"eth_getBlockByHash": {TTL: 24 * time.Hour}, "eth_getBlockByNumber": {TTL: 5 * time.Second},
@@ -126,7 +132,15 @@ func WithSeiHTTPEndpoint(endpoint string) Option {
 // WithAllowedOrigins sets the allowed CORS origins
 func WithAllowedOrigins(origins []string) Option {
 	return func(o *options) error {
-		o.allowedOrigins = origins
+		if o.allowedOrigins == nil {
+			o.allowedOrigins = make(map[string]bool)
+		}
+		for _, origin := range origins {
+			if origin == "" {
+				return errors.New("empty origin")
+			}
+			o.allowedOrigins[strings.ToLower(origin)] = true
+		}
 		return nil
 	}
 }
@@ -191,10 +205,18 @@ func WithMaxWSConnections(max int) Option {
 	}
 }
 
-// WithWSTimeout sets the WebSocket operation timeout
-func WithWSTimeout(timeout time.Duration) Option {
+// WithWSReadTimeout sets the WebSocket read operation timeout
+func WithWSReadTimeout(timeout time.Duration) Option {
 	return func(o *options) error {
-		o.wsTimeout = timeout
+		o.wsReadTimeout = timeout
+		return nil
+	}
+}
+
+// WithWSWriteTimeout sets the WebSocket write operation timeout
+func WithWSWriteTimeout(timeout time.Duration) Option {
+	return func(o *options) error {
+		o.wsWriteTimeout = timeout
 		return nil
 	}
 }
@@ -247,10 +269,10 @@ func WithMemcachedServers(servers []string) Option {
 	}
 }
 
-// WithCacheEnabled enables or disables caching
-func WithCacheEnabled(enabled bool) Option {
+// WithCache sets the JSON RPC response cache.
+func WithCache(cache Cache) Option {
 	return func(o *options) error {
-		o.cacheEnabled = enabled
+		o.cache = cache
 		return nil
 	}
 }

@@ -41,7 +41,8 @@ type SecurityConfig struct {
 
 type WebSocketConfig struct {
 	MaxConnections   int           `yaml:"max_connections"`
-	Timeout          time.Duration `yaml:"timeout"`
+	ReadTimeout      time.Duration `yaml:"read_timeout"`
+	WriteTimeout     time.Duration `yaml:"write_timeout"`
 	PingInterval     time.Duration `yaml:"ping_interval"`
 	MaxMessageSize   int64         `yaml:"max_message_size"`
 	ConnectionMaxAge time.Duration `yaml:"connection_max_age"`
@@ -127,8 +128,8 @@ func (c *Config) ToOptions() []Option {
 	if c.WebSocket.MaxConnections > 0 {
 		opts = append(opts, WithMaxWSConnections(c.WebSocket.MaxConnections))
 	}
-	if c.WebSocket.Timeout > 0 {
-		opts = append(opts, WithWSTimeout(c.WebSocket.Timeout))
+	if c.WebSocket.ReadTimeout > 0 {
+		opts = append(opts, WithWSReadTimeout(c.WebSocket.ReadTimeout))
 	}
 	if c.WebSocket.PingInterval > 0 {
 		opts = append(opts, WithWSPingInterval(c.WebSocket.PingInterval))
@@ -152,7 +153,6 @@ func (c *Config) ToOptions() []Option {
 	}
 
 	// MemcachedCache options
-	opts = append(opts, WithCacheEnabled(c.Cache.Enabled))
 	if len(c.Cache.MemcachedServers) > 0 {
 		opts = append(opts, WithMemcachedServers(c.Cache.MemcachedServers))
 	}

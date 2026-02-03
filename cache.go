@@ -22,7 +22,7 @@ type NoopCache struct{}
 
 func (n NoopCache) Get(context.Context, *JSONRPCRequest) (*JSONRPCResponse, bool) { return nil, false }
 
-func (n NoopCache) Set(ctx context.Context, request *JSONRPCRequest, response *JSONRPCResponse) {}
+func (n NoopCache) Set(context.Context, *JSONRPCRequest, *JSONRPCResponse) {}
 
 // MemcachedCache provides caching functionality using memcached
 type MemcachedCache struct {
@@ -94,7 +94,7 @@ func (c *MemcachedCache) Set(_ context.Context, req *JSONRPCRequest, resp *JSONR
 	}
 	ttl := cfg.TTL
 	if c.hasVolatileBlockTag(req) {
-		ttl = minDuration(ttl, 1*time.Second)
+		ttl = min(ttl, 1*time.Second)
 	}
 	toCache := *resp
 	if !cfg.KeyIncludesID {

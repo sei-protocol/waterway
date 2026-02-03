@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -171,6 +172,23 @@ func (c *WSConn) readLoop() {
 			c.pendingMu.Unlock()
 		}
 	}
+}
+
+func extractID(id json.RawMessage) uint64 {
+	if id == nil {
+		return 0
+	}
+	var num float64
+	if json.Unmarshal(id, &num) == nil {
+		return uint64(num)
+	}
+	var str string
+	if json.Unmarshal(id, &str) == nil {
+		if i, err := strconv.ParseUint(str, 10, 64); err == nil {
+			return i
+		}
+	}
+	return 0
 }
 
 func (c *WSConn) pingLoop(interval time.Duration) {
