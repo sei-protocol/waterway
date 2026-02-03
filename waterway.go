@@ -107,7 +107,6 @@ func (s *Waterway) ServeMux() *http.ServeMux {
 	mux.HandleFunc("OPTIONS /", s.handleHttpOptions)
 	mux.HandleFunc("POST /", s.handleHTTPPost)
 
-	// TODO: separate the port for the endpoints below?
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.Handle("GET /metrics", promhttp.Handler())
 	return mux
@@ -168,7 +167,7 @@ func (s *Waterway) callHTTP(ctx context.Context, req *JSONRPCRequest) (*JSONRPCR
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, s.maxRequestSize*10)) // Allow up to 10x request size as response
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, s.maxRequestSize*10))
 	metrics.responseSize.Record(ctx, int64(len(body)))
 
 	var rpcResp JSONRPCResponse
@@ -202,8 +201,7 @@ func (s *Waterway) shouldUseHTTP(method string) bool {
 }
 
 func (s *Waterway) call(ctx context.Context, req *JSONRPCRequest, requestedOverHttp bool) (*JSONRPCResponse, error) {
-
-	logger := logger.With("method", req.Method, "id", req.ID)
+	log := logger.With("method", req.Method, "id", req.ID)
 
 	transport, status := "ws", "success"
 	defer func(start time.Time) {
@@ -212,7 +210,7 @@ func (s *Waterway) call(ctx context.Context, req *JSONRPCRequest, requestedOverH
 
 	if err := s.validateRequest(req, requestedOverHttp); err != nil {
 		status = "invalid"
-		logger.Debug("Invalid request", "err", err)
+		log.Debug("Invalid request", "err", err)
 		return &JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: err}, nil
 	}
 
@@ -233,7 +231,7 @@ func (s *Waterway) call(ctx context.Context, req *JSONRPCRequest, requestedOverH
 		resp, err := s.callWS(ctx, req)
 		if err != nil {
 			status = "error"
-			logger.Debug("Subscription call failed", "err", err)
+			log.Debug("Subscription call failed", "err", err)
 		}
 		return resp, err
 	}
@@ -244,7 +242,7 @@ func (s *Waterway) call(ctx context.Context, req *JSONRPCRequest, requestedOverH
 		resp, err := s.callHTTP(ctx, req)
 		if err != nil {
 			status = "error"
-			logger.Debug("Call failed", "err", err)
+			log.Debug("Call failed", "err", err)
 			return nil, err
 		}
 		if resp.Error == nil {
@@ -263,7 +261,7 @@ func (s *Waterway) call(ctx context.Context, req *JSONRPCRequest, requestedOverH
 		resp, err := s.callHTTP(ctx, req)
 		if err != nil {
 			status = "error"
-			logger.Debug("HTTP fallback failed", "err", err)
+			log.Debug("HTTP fallback failed", "err", err)
 			return nil, err
 		}
 		if resp.Error == nil {
@@ -275,12 +273,12 @@ func (s *Waterway) call(ctx context.Context, req *JSONRPCRequest, requestedOverH
 	// Try WS first, fall back to HTTP on failure
 	resp, err := s.callWS(ctx, req)
 	if err != nil {
-		logger.Debug("WS call failed, falling back to HTTP", "err", err)
+		log.Debug("WS call failed, falling back to HTTP", "err", err)
 		return fallbackToHttp()
 	}
 
-	if resp.Error != nil && isWSIncompatibleError(resp.Error) { // Check for WS-incompatible response errors
-		logger.Debug("WS incompatible response, falling back to HTTP",
+	if resp.Error != nil && isWSIncompatibleError(resp.Error) {
+		log.Debug("WS incompatible response, falling back to HTTP",
 			"error_code", resp.Error.Code,
 			"error_message", resp.Error.Message)
 		s.wsFailedMethods.Store(req.Method, true)
@@ -306,7 +304,9 @@ func isWSIncompatibleError(err *JSONRPCError) bool {
 	return false
 }
 
-func (s *Waterway) handleHttpOptions(w http.ResponseWriter, _ *http.Request) { s.setCORS(w) }
+func (s *Waterway) handleHttpOptions(w http.ResponseWriter, _ *http.Request) {
+	s.setCORS(w)
+}
 
 func (s *Waterway) handleHTTPPost(w http.ResponseWriter, r *http.Request) {
 	s.setCORS(w)
@@ -366,7 +366,6 @@ func (s *Waterway) handleBatchHTTP(ctx context.Context, body []byte) []byte {
 
 	responses := make([]*JSONRPCResponse, len(batch))
 
-	// Small batches: process sequentially
 	if len(batch) <= 4 {
 		for i := range batch {
 			responses[i] = s.callSafe(ctx, &batch[i], true)
@@ -374,9 +373,8 @@ func (s *Waterway) handleBatchHTTP(ctx context.Context, body []byte) []byte {
 		return mustMarshal(responses)
 	}
 
-	// Larger batches: bounded parallelism
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, min(len(batch), 16)) // Cap actual concurrency
+	sem := make(chan struct{}, min(len(batch), 16))
 
 	for i := range batch {
 		wg.Add(1)
@@ -395,7 +393,6 @@ func (s *Waterway) handleBatchHTTP(ctx context.Context, body []byte) []byte {
 	return mustMarshal(responses)
 }
 
-// callSafe wraps call with panic recovery for safe use in goroutines.
 func (s *Waterway) callSafe(ctx context.Context, req *JSONRPCRequest, requestedOverHttp bool) *JSONRPCResponse {
 	defer func() {
 		if r := recover(); r != nil {
@@ -413,17 +410,14 @@ func (s *Waterway) callSafe(ctx context.Context, req *JSONRPCRequest, requestedO
 	return resp
 }
 
-// writeJSONRPCError writes a JSON-RPC error response.
 func writeJSONRPCError(w http.ResponseWriter, id json.RawMessage, code int, message string) {
 	response := mustMarshal(newErrorResponse(id, code, message))
 	_, _ = w.Write(response)
 }
 
-// mustMarshal marshals v to JSON, panicking on error (should never happen with valid structs).
 func mustMarshal(v any) []byte {
 	data, err := json.Marshal(v)
 	if err != nil {
-		// This should never happen with our response types
 		logger.Error("Failed to marshal JSON response", "err", err)
 		return []byte(`{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"}}`)
 	}
@@ -431,213 +425,230 @@ func mustMarshal(v any) []byte {
 }
 
 func (s *Waterway) handleWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := s.upgrader.Upgrade(w, r, nil)
+	clientConn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Error("Failed to upgrade websocket connection", "err", err)
 		return
 	}
 
-	// Create a context that we control (r.Context() is unreliable post-upgrade)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	metrics.activeConnections.Add(ctx, 1)
 	defer metrics.activeConnections.Add(ctx, -1)
-	defer conn.Close()
+	defer clientConn.Close()
 
-	conn.SetReadLimit(s.wsMaxMessageSize)
-	if err := conn.SetReadDeadline(time.Now().Add(s.wsReadTimeout)); err != nil {
-		logger.Error("Failed to set read deadline", "err", err)
+	// Connect to upstream
+	dialer := &websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		TLSClientConfig:  &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+	upstreamConn, _, err := dialer.DialContext(ctx, s.seiWSEndpoint, nil)
+	if err != nil {
+		logger.Error("Failed to connect to upstream", "err", err)
 		return
 	}
+	defer upstreamConn.Close()
 
-	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
+	clientConn.SetReadLimit(s.wsMaxMessageSize)
+	upstreamConn.SetReadLimit(s.wsMaxMessageSize)
+
+	// Setup pong handlers to reset read deadlines
+	clientConn.SetPongHandler(func(string) error {
+		return clientConn.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
+	})
+	upstreamConn.SetPongHandler(func(string) error {
+		return upstreamConn.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
 	})
 
-	conn.SetCloseHandler(func(code int, text string) error {
-		cancel()
-		return nil
-	})
+	// Set initial read deadlines
+	_ = clientConn.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
+	_ = upstreamConn.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
 
-	writeCh := make(chan []byte, 16) // Buffer some writes to reduce contention
-	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(3)
 
-	notifyError := func(err error) {
-		select {
-		case errCh <- err:
-		default:
-		}
-	}
-
+	// Ping both connections periodically
 	go func() {
-		pingTicker := time.NewTicker(s.wsPingInterval)
-		defer pingTicker.Stop()
-		for ctx.Err() == nil {
-			select {
-			case <-ctx.Done():
-				return
-			case msg, ok := <-writeCh:
-				if !ok {
-					return
-				}
-				if err := conn.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout)); err != nil {
-					notifyError(err)
-					return
-				}
-				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-					notifyError(err)
-					return
-				}
-			case <-pingTicker.C:
-				if err := conn.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout)); err != nil {
-					notifyError(err)
-					return
-				}
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					notifyError(err)
-					return
-				}
-			}
-		}
+		defer wg.Done()
+		s.wsPingLoop(ctx, clientConn, upstreamConn)
 	}()
 
-	// Read loop
-	for ctx.Err() == nil {
+	// Client -> Upstream (with validation)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		s.proxyClientToUpstream(ctx, clientConn, upstreamConn)
+	}()
+
+	// Upstream -> Client (pass-through)
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		s.proxyUpstreamToClient(ctx, upstreamConn, clientConn)
+	}()
+
+	wg.Wait()
+}
+
+func (s *Waterway) wsPingLoop(ctx context.Context, clientConn, upstreamConn *websocket.Conn) {
+	ticker := time.NewTicker(s.wsPingInterval)
+	defer ticker.Stop()
+
+	for {
 		select {
 		case <-ctx.Done():
 			return
-		case err := <-errCh:
-			logger.Debug("WebSocket write error", "err", err)
+		case <-ticker.C:
+			deadline := time.Now().Add(s.wsWriteTimeout)
+
+			if err := clientConn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+				logger.Debug("Failed to ping client", "err", err)
+				return
+			}
+
+			if err := upstreamConn.WriteControl(websocket.PingMessage, nil, deadline); err != nil {
+				logger.Debug("Failed to ping upstream", "err", err)
+				return
+			}
+		}
+	}
+}
+
+func (s *Waterway) proxyClientToUpstream(ctx context.Context, client, upstream *websocket.Conn) {
+	for {
+		select {
+		case <-ctx.Done():
 			return
 		default:
 		}
 
-		_, msg, err := conn.ReadMessage()
+		msgType, msg, err := client.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
-				logger.Debug("WebSocket read error", "err", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				logger.Debug("Client read error", "err", err)
 			}
 			return
 		}
 
-		if err := conn.SetReadDeadline(time.Now().Add(s.wsReadTimeout)); err != nil {
-			return
-		}
+		_ = client.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
 
 		metrics.requestSize.Record(ctx, int64(len(msg)))
 
-		msg = bytes.TrimSpace(msg)
-		if len(msg) == 0 {
-			continue
+		// Validate request (block forbidden methods)
+		if msgType == websocket.TextMessage {
+			if blocked, errResp := s.validateWSRequest(msg); blocked {
+				if errResp != nil {
+					_ = client.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout))
+					_ = client.WriteMessage(websocket.TextMessage, errResp)
+				}
+				continue
+			}
 		}
 
-		responses := s.processWSMessage(ctx, msg)
-		metrics.responseSize.Record(ctx, int64(len(responses)))
+		// Forward to upstream
+		if err := upstream.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout)); err != nil {
+			return
+		}
+		if err := upstream.WriteMessage(msgType, msg); err != nil {
+			logger.Debug("Upstream write error", "err", err)
+			return
+		}
+	}
+}
 
+func (s *Waterway) proxyUpstreamToClient(ctx context.Context, upstream, client *websocket.Conn) {
+	for {
 		select {
 		case <-ctx.Done():
 			return
-		case writeCh <- responses:
-		case err := <-errCh:
-			logger.Debug("WebSocket write error", "err", err)
+		default:
+		}
+
+		msgType, msg, err := upstream.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				logger.Debug("Upstream read error", "err", err)
+			}
+			return
+		}
+
+		_ = upstream.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
+
+		metrics.responseSize.Record(ctx, int64(len(msg)))
+
+		// Forward to client
+		if err := client.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout)); err != nil {
+			return
+		}
+		if err := client.WriteMessage(msgType, msg); err != nil {
+			logger.Debug("Client write error", "err", err)
 			return
 		}
 	}
 }
 
-func (s *Waterway) processWSMessage(ctx context.Context, msg []byte) []byte {
+func (s *Waterway) validateWSRequest(msg []byte) (blocked bool, errorResponse []byte) {
+	msg = bytes.TrimSpace(msg)
+	if len(msg) == 0 {
+		return false, nil
+	}
+
+	// Handle batch requests
 	if msg[0] == '[' {
-		return s.processWSBatch(ctx, msg)
-	}
-	return s.processWSSingle(ctx, msg)
-}
+		var batch []JSONRPCRequest
+		if json.Unmarshal(msg, &batch) != nil {
+			return false, nil // Let upstream handle parse errors
+		}
 
-func (s *Waterway) processWSSingle(ctx context.Context, msg []byte) []byte {
-	var req JSONRPCRequest
-	if err := json.Unmarshal(msg, &req); err != nil {
-		resp, _ := json.Marshal(newErrorResponse(nil, ErrCodeParse, "Parse error"))
-		return resp
-	}
-
-	resp, err := s.call(ctx, &req, false)
-	if err != nil {
-		resp = newErrorResponse(req.ID, ErrCodeInternal, "Internal error")
-	}
-
-	result, _ := json.Marshal(resp)
-	return result
-}
-
-func (s *Waterway) processWSBatch(ctx context.Context, msg []byte) []byte {
-	var batch []JSONRPCRequest
-	if err := json.Unmarshal(msg, &batch); err != nil {
-		resp, _ := json.Marshal(newErrorResponse(nil, ErrCodeParse, "Parse error"))
-		return resp
-	}
-
-	if len(batch) == 0 {
-		resp, _ := json.Marshal(newErrorResponse(nil, ErrCodeInvalidRequest, "Empty batch"))
-		return resp
-	}
-
-	if len(batch) > s.maxConcurrentBatch {
-		resp, _ := json.Marshal(newErrorResponse(nil, ErrCodeInvalidRequest, "Batch too large"))
-		return resp
-	}
-
-	resps := make([]*JSONRPCResponse, len(batch))
-
-	// For small batches, process sequentially to avoid goroutine overhead
-	if len(batch) <= 4 {
-		for i, req := range batch {
-			resp, err := s.call(ctx, &req, false)
-			if err != nil {
-				resps[i] = newErrorResponse(req.ID, ErrCodeInternal, "Internal error")
-			} else {
-				resps[i] = resp
+		for _, req := range batch {
+			if s.blockedMethods[req.Method] {
+				metrics.requestsBlocked.Add(context.Background(), 1, otelmetric.WithAttributes(
+					attribute.String("method", req.Method),
+				))
+				return true, mustMarshal(newErrorResponse(nil, ErrCodeForbidden, "Batch contains blocked method: "+req.Method))
+			}
+			if s.allowedMethods != nil && !s.allowedMethods[req.Method] {
+				metrics.requestsBlocked.Add(context.Background(), 1, otelmetric.WithAttributes(
+					attribute.String("method", req.Method),
+				))
+				return true, mustMarshal(newErrorResponse(nil, ErrCodeForbidden, "Batch contains disallowed method: "+req.Method))
 			}
 		}
-	} else {
-		// For larger batches, use bounded parallelism
-		sem := make(chan struct{}, min(len(batch), 16))
-		var wg sync.WaitGroup
-
-		for i, req := range batch {
-			wg.Add(1)
-			sem <- struct{}{}
-
-			go func(idx int, r JSONRPCRequest) {
-				defer func() {
-					<-sem
-					wg.Done()
-				}()
-
-				resp, err := s.call(ctx, &r, false)
-				if err != nil {
-					resps[idx] = newErrorResponse(r.ID, ErrCodeInternal, "Internal error")
-				} else {
-					resps[idx] = resp
-				}
-			}(i, req)
-		}
-		wg.Wait()
+		return false, nil
 	}
 
-	result, _ := json.Marshal(resps)
-	return result
+	// Handle single request
+	var req JSONRPCRequest
+	if json.Unmarshal(msg, &req) != nil {
+		return false, nil // Let upstream handle parse errors
+	}
+
+	if s.blockedMethods[req.Method] {
+		metrics.requestsBlocked.Add(context.Background(), 1, otelmetric.WithAttributes(
+			attribute.String("method", req.Method),
+		))
+		return true, mustMarshal(newErrorResponse(req.ID, ErrCodeForbidden, "Method not allowed"))
+	}
+
+	if s.allowedMethods != nil && !s.allowedMethods[req.Method] {
+		metrics.requestsBlocked.Add(context.Background(), 1, otelmetric.WithAttributes(
+			attribute.String("method", req.Method),
+		))
+		return true, mustMarshal(newErrorResponse(req.ID, ErrCodeForbidden, "Method not allowed"))
+	}
+
+	return false, nil
 }
 
 func (s *Waterway) setCORS(w http.ResponseWriter) {
 	if len(s.allowedOrigins) == 0 {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 	} else {
-
 		origins := make([]string, 0, len(s.allowedOrigins))
 		for origin := range s.allowedOrigins {
 			origins = append(origins, origin)
 		}
-
 		w.Header().Set("Access-Control-Allow-Origin", strings.Join(origins, ", "))
 	}
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
