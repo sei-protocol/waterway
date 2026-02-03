@@ -177,7 +177,102 @@ func (s *Waterway) callHTTP(ctx context.Context, req *JSONRPCRequest) (*JSONRPCR
 	return &rpcResp, nil
 }
 
-func (s *Waterway) callWS(ctx context.Context, req *JSONRPCRequest) (*JSONRPCResponse, error) {
+func (s *Waterway) shouldUseHTTP(method string) bool {
+	if s.httpOnlyMethods[method] {
+		return true
+	}
+	_, failed := s.wsFailedMethods.Load(method)
+	return failed
+}
+
+// call routes requests through caching and HTTP fallback logic.
+// For WS clients, subscription methods are handled separately via direct upstream forwarding.
+func (s *Waterway) call(ctx context.Context, req *JSONRPCRequest, requestedOverHttp bool, upstreamWS *websocket.Conn) (*JSONRPCResponse, error) {
+	log := logger.With("method", req.Method, "id", req.ID)
+
+	transport, status := "ws", "success"
+	defer func(start time.Time) {
+		recordRequest(ctx, req.Method, transport, status, time.Since(start))
+	}(time.Now())
+
+	if err := s.validateRequest(req, requestedOverHttp); err != nil {
+		status = "invalid"
+		log.Debug("Invalid request", "err", err)
+		return &JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: err}, nil
+	}
+
+	// Check cache first
+	if cached, hit := s.cache.Get(ctx, req); hit {
+		transport = "cache"
+		metrics.requestsCacheHit.Add(ctx, 1, otelmetric.WithAttributes(
+			attribute.String("method", req.Method),
+		))
+		return cached, nil
+	}
+
+	metrics.requestsCacheMiss.Add(ctx, 1, otelmetric.WithAttributes(
+		attribute.String("method", req.Method),
+	))
+
+	// Route based on method compatibility
+	if s.shouldUseHTTP(req.Method) {
+		transport = "http"
+		resp, err := s.callHTTP(ctx, req)
+		if err != nil {
+			status = "error"
+			log.Debug("HTTP call failed", "err", err)
+			return nil, err
+		}
+		if resp.Error == nil {
+			s.cache.Set(ctx, req, resp)
+		}
+		return resp, nil
+	}
+
+	// For WS clients with an upstream connection, use it directly
+	if upstreamWS != nil {
+		resp, err := s.callUpstreamWS(ctx, upstreamWS, req)
+		if err != nil {
+			log.Debug("Upstream WS call failed, falling back to HTTP", "err", err)
+			return s.callWithHTTPFallback(ctx, req, log, &transport, &status)
+		}
+
+		if resp.Error != nil && isWSIncompatibleError(resp.Error) {
+			log.Debug("WS incompatible response, falling back to HTTP",
+				"error_code", resp.Error.Code,
+				"error_message", resp.Error.Message)
+			s.wsFailedMethods.Store(req.Method, true)
+			return s.callWithHTTPFallback(ctx, req, log, &transport, &status)
+		}
+
+		if resp.Error == nil {
+			s.cache.Set(ctx, req, resp)
+		}
+		return resp, nil
+	}
+
+	// For HTTP clients or when no upstream WS, use the pool
+	resp, err := s.callWSPool(ctx, req)
+	if err != nil {
+		log.Debug("WS pool call failed, falling back to HTTP", "err", err)
+		return s.callWithHTTPFallback(ctx, req, log, &transport, &status)
+	}
+
+	if resp.Error != nil && isWSIncompatibleError(resp.Error) {
+		log.Debug("WS incompatible response, falling back to HTTP",
+			"error_code", resp.Error.Code,
+			"error_message", resp.Error.Message)
+		s.wsFailedMethods.Store(req.Method, true)
+		return s.callWithHTTPFallback(ctx, req, log, &transport, &status)
+	}
+
+	if resp.Error == nil {
+		s.cache.Set(ctx, req, resp)
+	}
+	return resp, nil
+}
+
+func (s *Waterway) callWSPool(ctx context.Context, req *JSONRPCRequest) (*JSONRPCResponse, error) {
 	defer func(start time.Time) {
 		metrics.upstreamDuration.Record(ctx, time.Since(start).Seconds(), otelmetric.WithAttributes(
 			attribute.String("transport", "ws"),
@@ -192,99 +287,73 @@ func (s *Waterway) callWS(ctx context.Context, req *JSONRPCRequest) (*JSONRPCRes
 	return conn.Call(ctx, req, s.wsReadTimeout)
 }
 
-func (s *Waterway) shouldUseHTTP(method string) bool {
-	if s.httpOnlyMethods[method] {
-		return true
-	}
-	_, failed := s.wsFailedMethods.Load(method)
-	return failed
-}
-
-func (s *Waterway) call(ctx context.Context, req *JSONRPCRequest, requestedOverHttp bool) (*JSONRPCResponse, error) {
-	log := logger.With("method", req.Method, "id", req.ID)
-
-	transport, status := "ws", "success"
+func (s *Waterway) callUpstreamWS(ctx context.Context, upstream *websocket.Conn, req *JSONRPCRequest) (*JSONRPCResponse, error) {
 	defer func(start time.Time) {
-		recordRequest(ctx, req.Method, transport, status, time.Since(start))
+		metrics.upstreamDuration.Record(ctx, time.Since(start).Seconds(), otelmetric.WithAttributes(
+			attribute.String("transport", "ws_direct"),
+		))
 	}(time.Now())
 
-	if err := s.validateRequest(req, requestedOverHttp); err != nil {
-		status = "invalid"
-		log.Debug("Invalid request", "err", err)
-		return &JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Error: err}, nil
+	// Generate internal request ID for correlation
+	internalID := time.Now().UnixNano()
+
+	data, _ := json.Marshal(struct {
+		JSONRPC string          `json:"jsonrpc"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params,omitempty"`
+		ID      int64           `json:"id"`
+	}{"2.0", req.Method, req.Params, internalID})
+
+	if err := upstream.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout)); err != nil {
+		return nil, err
+	}
+	if err := upstream.WriteMessage(websocket.TextMessage, data); err != nil {
+		return nil, err
 	}
 
-	if cached, hit := s.cache.Get(ctx, req); hit {
-		transport = "cache"
-		metrics.requestsCacheHit.Add(ctx, 1, otelmetric.WithAttributes(
-			attribute.String("method", req.Method),
-		))
-		return cached, nil
+	// Read response (with timeout)
+	if err := upstream.SetReadDeadline(time.Now().Add(s.wsReadTimeout)); err != nil {
+		return nil, err
 	}
 
-	metrics.requestsCacheMiss.Add(ctx, 1, otelmetric.WithAttributes(
+	for {
+		_, msg, err := upstream.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+
+		var resp JSONRPCResponse
+		if json.Unmarshal(msg, &resp) != nil {
+			continue
+		}
+
+		// Check if this is the response to our request
+		respID, _ := resp.ID.MarshalJSON()
+		expectedID, _ := json.Marshal(internalID)
+		if bytes.Equal(respID, expectedID) {
+			// Restore original request ID
+			resp.ID = req.ID
+			return &resp, nil
+		}
+
+		// This might be a subscription notification - we can't handle it here
+		// It will be lost, but that's okay for request/response calls
+	}
+}
+
+func (s *Waterway) callWithHTTPFallback(ctx context.Context, req *JSONRPCRequest, log *slog.Logger, transport, status *string) (*JSONRPCResponse, error) {
+	*transport = "http_fallback"
+
+	metrics.fallbackTotal.Add(ctx, 1, otelmetric.WithAttributes(
 		attribute.String("method", req.Method),
 	))
 
-	// Handle subscriptions (WS-only, not cacheable)
-	if req.Method == "eth_subscribe" || req.Method == "eth_unsubscribe" {
-		resp, err := s.callWS(ctx, req)
-		if err != nil {
-			status = "error"
-			log.Debug("Subscription call failed", "err", err)
-		}
-		return resp, err
-	}
-
-	// Route based on method compatibility
-	if s.shouldUseHTTP(req.Method) {
-		transport = "http"
-		resp, err := s.callHTTP(ctx, req)
-		if err != nil {
-			status = "error"
-			log.Debug("Call failed", "err", err)
-			return nil, err
-		}
-		if resp.Error == nil {
-			s.cache.Set(ctx, req, resp)
-		}
-		return resp, nil
-	}
-
-	fallbackToHttp := func() (*JSONRPCResponse, error) {
-		transport = "http_fallback"
-
-		metrics.fallbackTotal.Add(ctx, 1, otelmetric.WithAttributes(
-			attribute.String("method", req.Method),
-		))
-
-		resp, err := s.callHTTP(ctx, req)
-		if err != nil {
-			status = "error"
-			log.Debug("HTTP fallback failed", "err", err)
-			return nil, err
-		}
-		if resp.Error == nil {
-			s.cache.Set(ctx, req, resp)
-		}
-		return resp, nil
-	}
-
-	// Try WS first, fall back to HTTP on failure
-	resp, err := s.callWS(ctx, req)
+	resp, err := s.callHTTP(ctx, req)
 	if err != nil {
-		log.Debug("WS call failed, falling back to HTTP", "err", err)
-		return fallbackToHttp()
+		*status = "error"
+		log.Debug("HTTP fallback failed", "err", err)
+		return nil, err
 	}
-
-	if resp.Error != nil && isWSIncompatibleError(resp.Error) {
-		log.Debug("WS incompatible response, falling back to HTTP",
-			"error_code", resp.Error.Code,
-			"error_message", resp.Error.Message)
-		s.wsFailedMethods.Store(req.Method, true)
-		return fallbackToHttp()
-	}
-
 	if resp.Error == nil {
 		s.cache.Set(ctx, req, resp)
 	}
@@ -303,6 +372,10 @@ func isWSIncompatibleError(err *JSONRPCError) bool {
 	}
 	return false
 }
+
+// ============================================================================
+// HTTP Handlers
+// ============================================================================
 
 func (s *Waterway) handleHttpOptions(w http.ResponseWriter, _ *http.Request) {
 	s.setCORS(w)
@@ -346,7 +419,7 @@ func (s *Waterway) handleSingleHTTP(ctx context.Context, body []byte) []byte {
 		return mustMarshal(newErrorResponse(nil, ErrCodeParse, "Parse error"))
 	}
 
-	resp := s.callSafe(ctx, &req, true)
+	resp := s.callSafeHTTP(ctx, &req)
 	return mustMarshal(resp)
 }
 
@@ -368,7 +441,7 @@ func (s *Waterway) handleBatchHTTP(ctx context.Context, body []byte) []byte {
 
 	if len(batch) <= 4 {
 		for i := range batch {
-			responses[i] = s.callSafe(ctx, &batch[i], true)
+			responses[i] = s.callSafeHTTP(ctx, &batch[i])
 		}
 		return mustMarshal(responses)
 	}
@@ -385,7 +458,7 @@ func (s *Waterway) handleBatchHTTP(ctx context.Context, body []byte) []byte {
 				<-sem
 				wg.Done()
 			}()
-			responses[idx] = s.callSafe(ctx, &batch[idx], true)
+			responses[idx] = s.callSafeHTTP(ctx, &batch[idx])
 		}(i)
 	}
 
@@ -393,7 +466,7 @@ func (s *Waterway) handleBatchHTTP(ctx context.Context, body []byte) []byte {
 	return mustMarshal(responses)
 }
 
-func (s *Waterway) callSafe(ctx context.Context, req *JSONRPCRequest, requestedOverHttp bool) *JSONRPCResponse {
+func (s *Waterway) callSafeHTTP(ctx context.Context, req *JSONRPCRequest) *JSONRPCResponse {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Panic in RPC call",
@@ -403,7 +476,7 @@ func (s *Waterway) callSafe(ctx context.Context, req *JSONRPCRequest, requestedO
 		}
 	}()
 
-	resp, err := s.call(ctx, req, requestedOverHttp)
+	resp, err := s.call(ctx, req, true, nil)
 	if err != nil {
 		return newErrorResponse(req.ID, ErrCodeInternal, "Internal error")
 	}
@@ -424,6 +497,10 @@ func mustMarshal(v any) []byte {
 	return data
 }
 
+// ============================================================================
+// WebSocket Handler
+// ============================================================================
+
 func (s *Waterway) handleWS(w http.ResponseWriter, r *http.Request) {
 	clientConn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -438,7 +515,7 @@ func (s *Waterway) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer metrics.activeConnections.Add(ctx, -1)
 	defer clientConn.Close()
 
-	// Connect to upstream
+	// Connect to upstream for subscriptions
 	dialer := &websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:  &tls.Config{MinVersion: tls.VersionTLS12},
@@ -453,7 +530,7 @@ func (s *Waterway) handleWS(w http.ResponseWriter, r *http.Request) {
 	clientConn.SetReadLimit(s.wsMaxMessageSize)
 	upstreamConn.SetReadLimit(s.wsMaxMessageSize)
 
-	// Setup pong handlers to reset read deadlines
+	// Setup pong handlers
 	clientConn.SetPongHandler(func(string) error {
 		return clientConn.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
 	})
@@ -461,31 +538,40 @@ func (s *Waterway) handleWS(w http.ResponseWriter, r *http.Request) {
 		return upstreamConn.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
 	})
 
-	// Set initial read deadlines
 	_ = clientConn.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
 	_ = upstreamConn.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
 
-	var wg sync.WaitGroup
-	wg.Add(3)
+	// Channel for sending responses to client
+	clientWriteCh := make(chan []byte, 64)
+	errCh := make(chan error, 2)
 
-	// Ping both connections periodically
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	// Ping loop
 	go func() {
 		defer wg.Done()
 		s.wsPingLoop(ctx, clientConn, upstreamConn)
 	}()
 
-	// Client -> Upstream (with validation)
+	// Client writer - sends responses to client
 	go func() {
 		defer wg.Done()
-		defer cancel()
-		s.proxyClientToUpstream(ctx, clientConn, upstreamConn)
+		s.wsClientWriter(ctx, clientConn, clientWriteCh, errCh)
 	}()
 
-	// Upstream -> Client (pass-through)
+	// Upstream reader - forwards subscription notifications to client
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		s.proxyUpstreamToClient(ctx, upstreamConn, clientConn)
+		s.wsUpstreamReader(ctx, upstreamConn, clientWriteCh, errCh)
+	}()
+
+	// Client reader - reads requests, routes them appropriately
+	go func() {
+		defer wg.Done()
+		defer cancel()
+		s.wsClientReader(ctx, clientConn, upstreamConn, clientWriteCh, errCh)
 	}()
 
 	wg.Wait()
@@ -515,7 +601,35 @@ func (s *Waterway) wsPingLoop(ctx context.Context, clientConn, upstreamConn *web
 	}
 }
 
-func (s *Waterway) proxyClientToUpstream(ctx context.Context, client, upstream *websocket.Conn) {
+func (s *Waterway) wsClientWriter(ctx context.Context, client *websocket.Conn, writeCh <-chan []byte, errCh chan<- error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-writeCh:
+			if !ok {
+				return
+			}
+			if err := client.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout)); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+			if err := client.WriteMessage(websocket.TextMessage, msg); err != nil {
+				logger.Debug("Client write error", "err", err)
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+		}
+	}
+}
+
+func (s *Waterway) wsUpstreamReader(ctx context.Context, upstream *websocket.Conn, clientWriteCh chan<- []byte, errCh chan<- error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -523,7 +637,48 @@ func (s *Waterway) proxyClientToUpstream(ctx context.Context, client, upstream *
 		default:
 		}
 
-		msgType, msg, err := client.ReadMessage()
+		_, msg, err := upstream.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				logger.Debug("Upstream read error", "err", err)
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
+			return
+		}
+
+		_ = upstream.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
+
+		metrics.responseSize.Record(ctx, int64(len(msg)))
+
+		// Forward to client
+		select {
+		case clientWriteCh <- msg:
+		case <-ctx.Done():
+			return
+		default:
+			// Channel full, drop message
+			logger.Warn("Client write channel full, dropping message")
+		}
+	}
+}
+
+func (s *Waterway) wsClientReader(ctx context.Context, client, upstream *websocket.Conn, clientWriteCh chan<- []byte, errCh <-chan error) {
+	upstreamMu := &sync.Mutex{} // Protect upstream writes
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-errCh:
+			logger.Debug("Error from other goroutine", "err", err)
+			return
+		default:
+		}
+
+		_, msg, err := client.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				logger.Debug("Client read error", "err", err)
@@ -535,111 +690,176 @@ func (s *Waterway) proxyClientToUpstream(ctx context.Context, client, upstream *
 
 		metrics.requestSize.Record(ctx, int64(len(msg)))
 
-		// Validate request (block forbidden methods)
-		if msgType == websocket.TextMessage {
-			if blocked, errResp := s.validateWSRequest(msg); blocked {
-				if errResp != nil {
-					_ = client.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout))
-					_ = client.WriteMessage(websocket.TextMessage, errResp)
-				}
-				continue
-			}
+		msg = bytes.TrimSpace(msg)
+		if len(msg) == 0 {
+			continue
 		}
 
-		// Forward to upstream
-		if err := upstream.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout)); err != nil {
-			return
-		}
-		if err := upstream.WriteMessage(msgType, msg); err != nil {
-			logger.Debug("Upstream write error", "err", err)
-			return
+		// Route the request
+		response := s.routeWSRequest(ctx, msg, upstream, upstreamMu)
+		if response != nil {
+			select {
+			case clientWriteCh <- response:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }
 
-func (s *Waterway) proxyUpstreamToClient(ctx context.Context, upstream, client *websocket.Conn) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		msgType, msg, err := upstream.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				logger.Debug("Upstream read error", "err", err)
-			}
-			return
-		}
-
-		_ = upstream.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
-
-		metrics.responseSize.Record(ctx, int64(len(msg)))
-
-		// Forward to client
-		if err := client.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout)); err != nil {
-			return
-		}
-		if err := client.WriteMessage(msgType, msg); err != nil {
-			logger.Debug("Client write error", "err", err)
-			return
-		}
-	}
-}
-
-func (s *Waterway) validateWSRequest(msg []byte) (blocked bool, errorResponse []byte) {
-	msg = bytes.TrimSpace(msg)
-	if len(msg) == 0 {
-		return false, nil
-	}
-
-	// Handle batch requests
+func (s *Waterway) routeWSRequest(ctx context.Context, msg []byte, upstream *websocket.Conn, upstreamMu *sync.Mutex) []byte {
+	// Handle batches
 	if msg[0] == '[' {
-		var batch []JSONRPCRequest
-		if json.Unmarshal(msg, &batch) != nil {
-			return false, nil // Let upstream handle parse errors
-		}
-
-		for _, req := range batch {
-			if s.blockedMethods[req.Method] {
-				metrics.requestsBlocked.Add(context.Background(), 1, otelmetric.WithAttributes(
-					attribute.String("method", req.Method),
-				))
-				return true, mustMarshal(newErrorResponse(nil, ErrCodeForbidden, "Batch contains blocked method: "+req.Method))
-			}
-			if s.allowedMethods != nil && !s.allowedMethods[req.Method] {
-				metrics.requestsBlocked.Add(context.Background(), 1, otelmetric.WithAttributes(
-					attribute.String("method", req.Method),
-				))
-				return true, mustMarshal(newErrorResponse(nil, ErrCodeForbidden, "Batch contains disallowed method: "+req.Method))
-			}
-		}
-		return false, nil
+		return s.routeWSBatch(ctx, msg, upstream, upstreamMu)
 	}
 
-	// Handle single request
 	var req JSONRPCRequest
-	if json.Unmarshal(msg, &req) != nil {
-		return false, nil // Let upstream handle parse errors
+	if err := json.Unmarshal(msg, &req); err != nil {
+		return mustMarshal(newErrorResponse(nil, ErrCodeParse, "Parse error"))
 	}
 
+	// Check blocked methods
 	if s.blockedMethods[req.Method] {
-		metrics.requestsBlocked.Add(context.Background(), 1, otelmetric.WithAttributes(
+		metrics.requestsBlocked.Add(ctx, 1, otelmetric.WithAttributes(
 			attribute.String("method", req.Method),
 		))
-		return true, mustMarshal(newErrorResponse(req.ID, ErrCodeForbidden, "Method not allowed"))
+		return mustMarshal(newErrorResponse(req.ID, ErrCodeForbidden, "Method not allowed"))
 	}
-
 	if s.allowedMethods != nil && !s.allowedMethods[req.Method] {
-		metrics.requestsBlocked.Add(context.Background(), 1, otelmetric.WithAttributes(
+		metrics.requestsBlocked.Add(ctx, 1, otelmetric.WithAttributes(
 			attribute.String("method", req.Method),
 		))
-		return true, mustMarshal(newErrorResponse(req.ID, ErrCodeForbidden, "Method not allowed"))
+		return mustMarshal(newErrorResponse(req.ID, ErrCodeForbidden, "Method not allowed"))
 	}
 
-	return false, nil
+	// Subscriptions: forward directly to upstream, response comes via upstream reader
+	if req.Method == "eth_subscribe" || req.Method == "eth_unsubscribe" {
+		upstreamMu.Lock()
+		err := upstream.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout))
+		if err == nil {
+			err = upstream.WriteMessage(websocket.TextMessage, msg)
+		}
+		upstreamMu.Unlock()
+
+		if err != nil {
+			logger.Debug("Failed to forward subscription to upstream", "err", err)
+			return mustMarshal(newErrorResponse(req.ID, ErrCodeInternal, "Upstream error"))
+		}
+
+		// Response will come through wsUpstreamReader
+		return nil
+	}
+
+	// Regular requests: use call() with HTTP fallback, caching, etc.
+	resp, err := s.call(ctx, &req, false, nil)
+	if err != nil {
+		return mustMarshal(newErrorResponse(req.ID, ErrCodeInternal, "Internal error"))
+	}
+	return mustMarshal(resp)
 }
+
+func (s *Waterway) routeWSBatch(ctx context.Context, msg []byte, upstream *websocket.Conn, upstreamMu *sync.Mutex) []byte {
+	var batch []JSONRPCRequest
+	if err := json.Unmarshal(msg, &batch); err != nil {
+		return mustMarshal(newErrorResponse(nil, ErrCodeParse, "Parse error"))
+	}
+
+	if len(batch) == 0 {
+		return mustMarshal(newErrorResponse(nil, ErrCodeInvalidRequest, "Empty batch"))
+	}
+
+	if len(batch) > s.maxConcurrentBatch {
+		return mustMarshal(newErrorResponse(nil, ErrCodeInvalidRequest, "Batch too large"))
+	}
+
+	// Check for blocked methods
+	for _, req := range batch {
+		if s.blockedMethods[req.Method] {
+			metrics.requestsBlocked.Add(ctx, 1, otelmetric.WithAttributes(
+				attribute.String("method", req.Method),
+			))
+			return mustMarshal(newErrorResponse(nil, ErrCodeForbidden, "Batch contains blocked method: "+req.Method))
+		}
+		if s.allowedMethods != nil && !s.allowedMethods[req.Method] {
+			metrics.requestsBlocked.Add(ctx, 1, otelmetric.WithAttributes(
+				attribute.String("method", req.Method),
+			))
+			return mustMarshal(newErrorResponse(nil, ErrCodeForbidden, "Batch contains disallowed method: "+req.Method))
+		}
+	}
+
+	// Check if batch contains subscriptions
+	hasSubscription := false
+	for _, req := range batch {
+		if req.Method == "eth_subscribe" || req.Method == "eth_unsubscribe" {
+			hasSubscription = true
+			break
+		}
+	}
+
+	// If batch contains subscriptions, forward entire batch to upstream
+	if hasSubscription {
+		upstreamMu.Lock()
+		err := upstream.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout))
+		if err == nil {
+			err = upstream.WriteMessage(websocket.TextMessage, msg)
+		}
+		upstreamMu.Unlock()
+
+		if err != nil {
+			logger.Debug("Failed to forward batch to upstream", "err", err)
+			return mustMarshal(newErrorResponse(nil, ErrCodeInternal, "Upstream error"))
+		}
+
+		// Response will come through wsUpstreamReader
+		return nil
+	}
+
+	// No subscriptions: process through call() with HTTP fallback
+	responses := make([]*JSONRPCResponse, len(batch))
+
+	if len(batch) <= 4 {
+		for i := range batch {
+			resp, err := s.call(ctx, &batch[i], false, nil)
+			if err != nil {
+				responses[i] = newErrorResponse(batch[i].ID, ErrCodeInternal, "Internal error")
+			} else {
+				responses[i] = resp
+			}
+		}
+		return mustMarshal(responses)
+	}
+
+	// Parallel processing for larger batches
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, min(len(batch), 16))
+
+	for i := range batch {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(idx int) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+
+			resp, err := s.call(ctx, &batch[idx], false, nil)
+			if err != nil {
+				responses[idx] = newErrorResponse(batch[idx].ID, ErrCodeInternal, "Internal error")
+			} else {
+				responses[idx] = resp
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	return mustMarshal(responses)
+}
+
+// ============================================================================
+// Utility
+// ============================================================================
 
 func (s *Waterway) setCORS(w http.ResponseWriter) {
 	if len(s.allowedOrigins) == 0 {
