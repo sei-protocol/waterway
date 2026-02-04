@@ -103,7 +103,7 @@ func (s *Waterway) Start(ctx context.Context) error {
 func (s *Waterway) ServeMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /", s.handleWS)
+	mux.HandleFunc("GET /", s.handleRoot)
 	mux.HandleFunc("OPTIONS /", s.handleHttpOptions)
 	mux.HandleFunc("POST /", s.handleHTTPPost)
 
@@ -501,6 +501,27 @@ func mustMarshal(v any) []byte {
 // WebSocket Handler
 // ============================================================================
 
+func (s *Waterway) handleRoot(w http.ResponseWriter, r *http.Request) {
+	// Check if this is a WebSocket upgrade request
+	if websocket.IsWebSocketUpgrade(r) {
+		s.handleWS(w, r)
+		return
+	}
+
+	// Regular HTTP GET - return service info
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"service": "waterway",
+		"status":  "ok",
+		"endpoints": map[string]string{
+			"websocket": "GET / (with Upgrade header)",
+			"http_rpc":  "POST /",
+			"health":    "GET /health",
+			"metrics":   "GET /metrics",
+		},
+	})
+}
+
 func (s *Waterway) handleWS(w http.ResponseWriter, r *http.Request) {
 	clientConn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -651,7 +672,35 @@ func (s *Waterway) wsUpstreamReader(ctx context.Context, upstream *websocket.Con
 
 		_ = upstream.SetReadDeadline(time.Now().Add(s.wsReadTimeout))
 
+		// Log all upstream messages at debug level
+		logger.Debug("Upstream message received", "size", len(msg), "raw", string(msg))
+
 		metrics.responseSize.Record(ctx, int64(len(msg)))
+
+		// Check for problematic responses and skip them
+		if reason := s.checkMalformedResponse(msg); reason != "" {
+			logger.Warn("Skipping malformed upstream response",
+				"reason", reason,
+				"raw", string(msg),
+			)
+			metrics.malformedResponses.Add(ctx, 1, otelmetric.WithAttributes(
+				attribute.String("reason", reason),
+			))
+			continue
+		}
+
+		// Check for upstream errors (rate limiting, etc.)
+		if errInfo := s.checkUpstreamError(msg); errInfo != nil {
+			logger.Warn("Upstream error response",
+				"code", errInfo.Code,
+				"message", errInfo.Message,
+				"raw", string(msg),
+			)
+			metrics.upstreamErrors.Add(ctx, 1, otelmetric.WithAttributes(
+				attribute.Int("code", errInfo.Code),
+			))
+			// Still forward errors to client - they need to know
+		}
 
 		// Forward to client
 		select {
@@ -659,10 +708,165 @@ func (s *Waterway) wsUpstreamReader(ctx context.Context, upstream *websocket.Con
 		case <-ctx.Done():
 			return
 		default:
-			// Channel full, drop message
-			logger.Warn("Client write channel full, dropping message")
+			logger.Warn("Client write channel full, dropping message", "size", len(msg))
+			metrics.droppedMessages.Add(ctx, 1)
 		}
 	}
+}
+
+// checkMalformedResponse checks if a message is malformed and should be skipped.
+// Returns empty string if OK, otherwise returns the reason for skipping.
+func (s *Waterway) checkMalformedResponse(msg []byte) string {
+	msg = bytes.TrimSpace(msg)
+
+	// Empty message
+	if len(msg) == 0 {
+		return "empty_message"
+	}
+
+	// Empty JSON object
+	if bytes.Equal(msg, []byte("{}")) {
+		return "empty_json_object"
+	}
+
+	// Try to parse as JSON
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(msg, &raw) != nil {
+		return "invalid_json"
+	}
+
+	// Check for subscription notifications
+	if methodRaw, hasMethod := raw["method"]; hasMethod {
+		var method string
+		if json.Unmarshal(methodRaw, &method) != nil {
+			return "invalid_method_field"
+		}
+
+		if method == "eth_subscription" {
+			return s.checkSubscriptionNotification(raw)
+		}
+	}
+
+	// Check for regular responses (has "id" field)
+	if _, hasID := raw["id"]; hasID {
+		return s.checkRegularResponse(raw)
+	}
+
+	return ""
+}
+
+// checkSubscriptionNotification validates eth_subscription notifications
+func (s *Waterway) checkSubscriptionNotification(raw map[string]json.RawMessage) string {
+	paramsRaw, hasParams := raw["params"]
+	if !hasParams {
+		return "subscription_missing_params"
+	}
+
+	// Check for empty params
+	params := bytes.TrimSpace(paramsRaw)
+	if len(params) == 0 || bytes.Equal(params, []byte("null")) || bytes.Equal(params, []byte("{}")) {
+		return "subscription_empty_params"
+	}
+
+	var paramsObj struct {
+		Subscription string          `json:"subscription"`
+		Result       json.RawMessage `json:"result"`
+	}
+	if json.Unmarshal(paramsRaw, &paramsObj) != nil {
+		return "subscription_invalid_params"
+	}
+
+	if paramsObj.Subscription == "" {
+		return "subscription_missing_id"
+	}
+
+	// Check result
+	result := bytes.TrimSpace(paramsObj.Result)
+	if len(result) == 0 {
+		return "subscription_empty_result"
+	}
+
+	if bytes.Equal(result, []byte("null")) {
+		return "subscription_null_result"
+	}
+
+	if bytes.Equal(result, []byte("{}")) {
+		return "subscription_empty_object_result"
+	}
+
+	if bytes.Equal(result, []byte("[]")) {
+		return "subscription_empty_array_result"
+	}
+
+	// For log subscriptions, check for required 'address' field
+	if bytes.Contains(result, []byte("topics")) || bytes.Contains(result, []byte("logIndex")) {
+		var logResult struct {
+			Address string `json:"address"`
+		}
+		if json.Unmarshal(result, &logResult) == nil && logResult.Address == "" {
+			return "log_missing_address"
+		}
+	}
+
+	return ""
+}
+
+// checkRegularResponse validates regular JSON-RPC responses
+func (s *Waterway) checkRegularResponse(raw map[string]json.RawMessage) string {
+	// If it has an error field, it's an error response - let it through
+	// (we handle errors separately in checkUpstreamError)
+	if _, hasError := raw["error"]; hasError {
+		return ""
+	}
+
+	// Check for result field
+	resultRaw, hasResult := raw["result"]
+	if !hasResult {
+		// No result and no error - malformed response
+		return "response_missing_result"
+	}
+
+	// Check for empty/null result
+	result := bytes.TrimSpace(resultRaw)
+	if len(result) == 0 {
+		return "response_empty_result"
+	}
+
+	// Note: "null" is a valid result for some methods (e.g., eth_getTransactionReceipt for pending tx)
+	// So we don't skip null results for regular responses
+
+	// Empty object might be valid for some responses, but empty params in a response is suspicious
+	// We'll allow {} for now but log it at debug level
+	if bytes.Equal(result, []byte("{}")) {
+		logger.Debug("Response with empty object result", "raw", string(resultRaw))
+	}
+
+	return ""
+}
+
+// upstreamErrorInfo holds information about an upstream error
+type upstreamErrorInfo struct {
+	Code    int
+	Message string
+}
+
+// checkUpstreamError checks if a message is an error response
+func (s *Waterway) checkUpstreamError(msg []byte) *upstreamErrorInfo {
+	var resp struct {
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	if json.Unmarshal(msg, &resp) == nil && resp.Error != nil {
+		return &upstreamErrorInfo{
+			Code:    resp.Error.Code,
+			Message: resp.Error.Message,
+		}
+	}
+
+	return nil
 }
 
 func (s *Waterway) wsClientReader(ctx context.Context, client, upstream *websocket.Conn, clientWriteCh chan<- []byte, errCh <-chan error) {
@@ -694,6 +898,9 @@ func (s *Waterway) wsClientReader(ctx context.Context, client, upstream *websock
 		if len(msg) == 0 {
 			continue
 		}
+
+		// Log client requests at debug level
+		logger.Debug("Client request received", "raw", string(msg))
 
 		// Route the request
 		response := s.routeWSRequest(ctx, msg, upstream, upstreamMu)
@@ -734,6 +941,8 @@ func (s *Waterway) routeWSRequest(ctx context.Context, msg []byte, upstream *web
 
 	// Subscriptions: forward directly to upstream, response comes via upstream reader
 	if req.Method == "eth_subscribe" || req.Method == "eth_unsubscribe" {
+		logger.Debug("Forwarding subscription request to upstream", "method", req.Method, "id", req.ID)
+
 		upstreamMu.Lock()
 		err := upstream.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout))
 		if err == nil {
@@ -799,6 +1008,8 @@ func (s *Waterway) routeWSBatch(ctx context.Context, msg []byte, upstream *webso
 
 	// If batch contains subscriptions, forward entire batch to upstream
 	if hasSubscription {
+		logger.Debug("Forwarding batch with subscriptions to upstream", "size", len(batch))
+
 		upstreamMu.Lock()
 		err := upstream.SetWriteDeadline(time.Now().Add(s.wsWriteTimeout))
 		if err == nil {

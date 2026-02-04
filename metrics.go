@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -31,30 +30,27 @@ var (
 		activeConnections   otelmetric.Int64UpDownCounter
 		wsPoolSize          otelmetric.Int64UpDownCounter
 
-		// Atomic counters for quick access
-		RequestsTotalVal     atomic.Uint64
-		CacheHitsVal         atomic.Uint64
-		CacheMissesVal       atomic.Uint64
-		ActiveConnectionsVal atomic.Int64
+		// New metrics for upstream monitoring
+		malformedResponses otelmetric.Int64Counter
+		upstreamErrors     otelmetric.Int64Counter
+		droppedMessages    otelmetric.Int64Counter
 	}{
-		requestsTotal:       must(meter.Int64Counter("requests_total")),
-		requestsCacheHit:    must(meter.Int64Counter("cache_hits_total")),
-		requestsCacheMiss:   must(meter.Int64Counter("cache_misses_total")),
-		requestsBlocked:     must(meter.Int64Counter("requests_blocked_total")),
-		requestsRateLimited: must(meter.Int64Counter("requests_rate_limited_total")),
-		errorsTotal:         must(meter.Int64Counter("errors_total")),
-		fallbackTotal:       must(meter.Int64Counter("fallback_total")),
-		requestDuration:     must(meter.Float64Histogram("request_duration_seconds", secondsBucket)),
-		upstreamDuration:    must(meter.Float64Histogram("upstream_duration_seconds", secondsBucket)),
-		requestSize:         must(meter.Int64Histogram("request_size_bytes", bytesSizeBucket)),
-		responseSize:        must(meter.Int64Histogram("response_size_bytes", bytesSizeBucket)),
-		activeConnections:   must(meter.Int64UpDownCounter("active_connections")),
-		wsPoolSize:          must(meter.Int64UpDownCounter("ws_pool_size")),
-
-		RequestsTotalVal:     atomic.Uint64{},
-		CacheHitsVal:         atomic.Uint64{},
-		CacheMissesVal:       atomic.Uint64{},
-		ActiveConnectionsVal: atomic.Int64{},
+		requestsTotal:       must(meter.Int64Counter("requests_total", otelmetric.WithDescription("Total number of requests processed"))),
+		requestsCacheHit:    must(meter.Int64Counter("cache_hits_total", otelmetric.WithDescription("Total number of cache hits"))),
+		requestsCacheMiss:   must(meter.Int64Counter("cache_misses_total", otelmetric.WithDescription("Total number of cache misses"))),
+		requestsBlocked:     must(meter.Int64Counter("requests_blocked_total", otelmetric.WithDescription("Total number of blocked requests"))),
+		requestsRateLimited: must(meter.Int64Counter("requests_rate_limited_total", otelmetric.WithDescription("Total number of rate limited requests"))),
+		errorsTotal:         must(meter.Int64Counter("errors_total", otelmetric.WithDescription("Total number of errors"))),
+		fallbackTotal:       must(meter.Int64Counter("fallback_total", otelmetric.WithDescription("Total number of HTTP fallbacks"))),
+		requestDuration:     must(meter.Float64Histogram("request_duration_seconds", secondsBucket, otelmetric.WithDescription("Request duration in seconds"))),
+		upstreamDuration:    must(meter.Float64Histogram("upstream_duration_seconds", secondsBucket, otelmetric.WithDescription("Upstream call duration in seconds"))),
+		requestSize:         must(meter.Int64Histogram("request_size_bytes", bytesSizeBucket, otelmetric.WithDescription("Request size in bytes"))),
+		responseSize:        must(meter.Int64Histogram("response_size_bytes", bytesSizeBucket, otelmetric.WithDescription("Response size in bytes"))),
+		activeConnections:   must(meter.Int64UpDownCounter("active_connections", otelmetric.WithDescription("Number of active WebSocket connections"))),
+		wsPoolSize:          must(meter.Int64UpDownCounter("ws_pool_size", otelmetric.WithDescription("Number of connections in WebSocket pool"))),
+		malformedResponses:  must(meter.Int64Counter("malformed_responses_total", otelmetric.WithDescription("Total number of malformed responses from upstream that were skipped"))),
+		upstreamErrors:      must(meter.Int64Counter("upstream_errors_total", otelmetric.WithDescription("Total number of error responses from upstream"))),
+		droppedMessages:     must(meter.Int64Counter("dropped_messages_total", otelmetric.WithDescription("Total number of messages dropped due to full write channel"))),
 	}
 )
 
@@ -76,7 +72,6 @@ func recordRequest(ctx context.Context, method, transport, status string, durati
 	)
 	metrics.requestsTotal.Add(ctx, 1, attrs)
 	metrics.requestDuration.Record(ctx, duration.Seconds(), attrs)
-	metrics.RequestsTotalVal.Add(1)
 }
 
 // must panics if err is non-nil, otherwise returns v.
